@@ -1,0 +1,167 @@
+---
+title: "Silverio_Vasquez_Project1"
+author: "Silverio Vasquez"
+date: "September 24, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## WTI - Moving Average Crossover Strategy
+
+This R script goes to the EIA website and scrapes the daily WTI prices. A weekly average is calculated, then 13-,26-, and 52-week averages are calculated for a simple moving avreage crossover strategy. 
+
+Then a long/short signal is created if the weekly average is above/below the 52-week average +/- 1 standard deviation.
+
+```{r wti}
+# Get packages
+#-----------------------------------------------------
+# install.packages('rvest')
+# install.packages('zoo')
+# install.packages('dygraphs')
+library(rvest)
+library(stringr)
+library(zoo)
+library(dygraphs)
+library(xts)
+#-----------------------------------------------------
+
+# Define function
+#-----------------------------------------------------
+mon_convert <- function(x){
+        counter = 1
+        limit =13
+        mon_az <- c("jan","feb","mar","apr","may","jun","jul","aug",
+                    "sep","oct","nov","dec")
+        while (counter < limit){
+                if (tolower(x) == mon_az[counter]) break
+                counter = counter + 1
+        }
+        if (counter > 12) return(0)
+        return(counter)
+}
+#-----------------------------------------------------
+```
+
+
+Get HTML for EIA website and extract the table headers in the 'B6' CSS class, as well as the WTI spot prices in the 'B3' CSS class.
+
+```{r html}
+# Website URL
+url <- 'https://www.eia.gov/dnav/pet/hist/LeafHandler.ashx?n=PET&s=RCLC1&f=D'
+
+# Read website HTML
+wb <- read_html(url)
+
+# Extract B6 CSS class
+wti_html <- html_nodes(wb,'.B6')
+wti_text <- html_text(wti_html)
+
+# Extract B3 CSS class
+price_html <- html_nodes(wb,'.B3')
+price_text <- html_text(price_html)
+```
+
+
+Strip whitespace surrounding text extracted from HTML code. Then convert numbers from characters to numbers, and split year and week into two buckets for 2 columns.
+
+```{r parse}
+wti_text <- str_trim(wti_text)
+price_text <- as.numeric(price_text)
+year_week <- str_split_fixed(wti_text," ",2)
+```
+
+Convert extracted data into a dataframe
+
+```{r df}
+df <- as.data.frame(matrix(price_text,ncol = 5,byrow = T))
+df <- cbind(year_week[,1],year_week[,2],df)
+names(df) <- c('year','week','mon','tues','wed','thurs','fri')
+head(df)
+```
+
+Extract latest date for prices and create a vector of weekly dates to use for plotting, etc.
+
+```{r date}
+date <- df$week[dim(df)[1]]
+date <- str_split_fixed(date," ",3)[3]
+year <- str_trim(df$year[dim(df)[1]])
+mon <- str_extract_all(date,"[[:alpha:]]+")
+day <- str_extract_all(date,"[0-9]+")
+
+# Use mon_convert function to convert 3 character month into an integer
+mon_n <- mon_convert(mon)
+
+date_str <- paste0(year,"/",mon_n,"/",day)
+
+print(paste0('Latest price as of ', date_str))
+
+# Create a vector of weekly dates (each Friday)
+idx <- seq(as.Date('1983/4/8'), as.Date(date_str),"week")
+head(idx)
+```
+
+Calculate moving averages for WTI prices and 52 week standard deviation
+
+```{r sma}
+df$wkavg <- apply(df[,3:7],1,mean,na.rm = TRUE)
+df$wkavg13 <- rollmean(df$wkavg,13,fill=NA,align='right')
+df$wkavg26 <- rollmean(df$wkavg,26,fill=NA,align='right')
+df$wkavg52 <- rollmean(df$wkavg,52,fill=NA,align='right')
+df$wkstd52 <- rollapply(df$wkavg,52,FUN=sd,fill=NA,align='right')
+
+# Show top of dataframe
+head(df)
+
+# Show bottom of dataframe
+tail(df)
+```
+
+Calculate the log difference of the weekly WTI price aka returns.
+Then calculate the position (long or short, +1 or -1) based on whether the weekly average price is above/below the 52-week avg +/- 1 standard deviation. 
+
+```{r signal}
+df$wkret <- c(0,diff(log(df$wkavg),lag=1))
+df$post <- ifelse(df$wkavg > (df$wkavg52+df$wkstd52),1, ifelse(df$wkavg < (df$wkavg52-df$wkstd52), -1, 0))
+```
+
+Make a new dataframe with two columns: weekly returns and long/short signal.
+Calculate the strategy's equity curve (the growth of a $1 investment) and plot it.
+
+```{r port}
+port <- xts(cbind(df$wkavg,df$wkavg13,df$wkavg26,df$wkavg52,df$post,df$wkret),order.by=as.Date(idx))
+names(port) <- c('wkavg','13wkavg','26wkavg','52wkavg','signal','ret')
+
+port$signal <- lag(port$signal,1)
+port$signal[is.na(port$signal)] <- 0
+
+port$pnl <- port$ret * port$signal
+port$temp <- 0
+port$temp <- port$pnl + 1
+equity_curve <- cumprod(port$temp)
+dygraph(equity_curve,main='Equity Curve') %>% dyRangeSelector()
+
+annRet <- (prod(port$temp)^(1/length(port$temp)))**52*100-100
+annStd <- sd(port$temp) * sqrt(52) * 100
+
+print(paste0('The annualized return is ',toString(round(annRet,3)),'%.'))
+print(paste0('The annualized standard deviation is ',toString(round(annStd,3)),'%.'))
+print(paste0('The Sharpe ratio is ',toString(round(annRet/annStd,3)),'.'))
+```
+
+Create a plot with weekly averages, 13-week, 26-week, and 52-week averages.
+
+```{r plot, echo=FALSE}
+chart <- xts(cbind(df$wkavg,df$wkavg13,df$wkavg26,df$wkavg52),order.by = as.Date(idx))
+names(chart) <- c('WkAvg','13wkAvg','26wkAvg','52wkAvg')
+dygraph(chart,main="WTI Moving Averages") %>% dyRangeSelector()
+```
+
+Export necessary data as CSV file.
+```{r export}
+port <- cbind(port,equity_curve)
+names(port)[9] <- 'equity_curve'
+write.csv(as.data.frame(port),file="wti_portfolio.csv",row.names = TRUE)
+```
